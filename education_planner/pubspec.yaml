@@ -1,0 +1,52 @@
+name: education_planner
+description: A Very Good Project created by Very Good CLI.
+version: 1.0.0+1
+publish_to: none
+
+environment:
+  sdk: ^3.6.1
+  flutter: 3.27.3
+
+dependencies:
+  api_client: 
+    path: packages/api_client
+  auth_client: 
+    path: packages/auth_client
+  bloc: ^8.1.4
+  collection: ^1.19.0
+  cupertino_icons: ^1.0.8
+  equatable: ^2.0.7
+  file_picker: ^9.1.0
+  flutter:
+    sdk: flutter
+  flutter_bloc: ^8.1.6
+  flutter_localizations:
+    sdk: flutter
+  form_inputs:
+    path: packages/form_inputs
+  go_router: ^14.8.1
+  google_fonts: ^6.2.1
+  intl: ^0.19.0
+  meta: ^1.15.0
+  planner_repository:
+    path: packages/planner_repository
+  shared_preferences: ^2.5.3  
+  shimmer: ^3.0.0
+  student_repository: 
+    path: packages/student_repository
+  user_repository: 
+    path: packages/user_repository
+
+
+  
+
+dev_dependencies:
+  bloc_test: ^9.1.7
+  flutter_test:
+    sdk: flutter
+  mocktail: ^1.0.4
+  very_good_analysis: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  generate: true

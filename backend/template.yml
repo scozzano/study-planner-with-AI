@@ -1,0 +1,545 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Globals:
+  Api:
+    Cors:
+      AllowMethods: "'GET,POST,OPTIONS'"
+      AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+      AllowOrigin: "'*'"
+
+Parameters:
+  TableName:
+    Type: String
+    Default: AdaProjectTable
+    Description: Nombre de la tabla DynamoDB usada por las Lambdas
+  S3BucketName:
+    Type: String
+    Default: recommendation-data-ort
+    Description: Bucket S3 para outputs y artefactos de entrenamiento
+  S3Prefix:
+    Type: String
+    Default: recommenders
+    Description: Prefijo S3 para outputs
+  CreateBucket:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true','false']
+    Description: "Si 'true', crea el bucket S3"
+
+Conditions:
+  ShouldCreateBucket: !Equals [!Ref CreateBucket, 'true']
+
+Resources:
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldCreateBucket
+    Properties:
+      BucketName: !Ref S3BucketName
+
+  MyApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: AdaProjectApi
+      StageName: prod
+      Models:
+        UploadFileRequestModel:
+          type: object
+          required: [file]
+          properties:
+            file: { type: string }
+        EditPlanSubjectsRequestModel:
+          type: object
+          required: [subjects]
+          properties:
+            subjects:
+              type: array
+              items:
+                type: object
+                required: [code]
+                properties:
+                  code: { type: string }
+                  semester: { type: string }
+                  status: { type: string }
+                  grade: { type: integer }
+        SageMakerTrainRequestModel:
+          type: object
+          required: [algorithm, degreeId]
+          properties:
+            algorithm: { type: string, description: "Algoritmo a entrenar: asb, rf, pm, spm" }
+            degreeId: { type: string }
+            config:
+              type: object
+              description: "Configuraciones personalizadas del algoritmo"
+        SageMakerPredictRequestModel:
+          type: object
+          required: [studentId, algorithm, degreeId]
+          properties:
+            studentId: { type: string }
+            algorithm: { type: string, description: "Algoritmo a usar: asb, rf, pm, spm" }
+            degreeId: { type: string }
+        ASBRecommenderUnifiedRequestModel:
+          type: object
+          required: [degree_id]
+          properties:
+            degree_id: { type: string, description: "ID del grado/carrera" }
+            table_name: { type: string, description: "Nombre de la tabla DynamoDB (opcional)" }
+            analysis_config:
+              type: object
+              description: "Configuración del análisis ASB"
+              properties:
+                label: { type: string, description: "Tipo de etiqueta: Overall GPA, Course grade, Pass/Fail" }
+                course: { type: string, description: "ID del curso para análisis a nivel de curso" }
+                is_binary_label: { type: boolean, description: "Usar etiquetas binarias (2 niveles) o 5 niveles" }
+                max_depth: { type: integer, description: "Profundidad máxima del árbol de decisión" }
+                is_atomic: { type: boolean, description: "Usar características atómicas o no atómicas" }
+                is_pm: { type: boolean, description: "Usar características de process mining" }
+                index_type: { type: string, description: "Tipo de índice: fachsemester, order, distance" }
+                feature: { type: string, description: "Tipo de característica: Course-Semester, Course-Order, etc." }
+                label_index: { type: integer, description: "Índice de la etiqueta para análisis a nivel de curso" }
+                combinations: { type: array, items: { type: string }, description: "Combinaciones de características: behav, diff, num, etc." }
+            sample_size: { type: integer, description: "Número de estudiantes a muestrear (opcional)" }
+            output_to_s3: { type: boolean, description: "Si guardar los resultados en S3 (opcional)" }
+            s3_bucket: { type: string, description: "Bucket S3 para guardar resultados (opcional)" }
+            s3_key: { type: string, description: "Clave S3 para guardar resultados (opcional)" }
+            include_data_summary: { type: boolean, description: "Incluir resumen de datos (opcional)" }
+            include_raw_data: { type: boolean, description: "Incluir datos raw (opcional, solo para muestras pequeñas)" }
+  SchoolingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+  StudentActivityBucket:
+    Type: AWS::S3::Bucket
+
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'asb-sagemaker-exec-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: sagemaker-ecr-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+
+  UploadSchoolingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handler/update_schooling_handler.lambda_handler
+      Runtime: python3.12
+      CodeUri: .
+      MemorySize: 512
+      Timeout: 30
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonDynamoDBFullAccess
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Events:
+        UploadSchoolingAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApi
+            Path: /students/schooling
+            Method: post
+            RequestModel:
+              Model: UploadFileRequestModel
+              Required: true
+            RequestParameters:
+              method.request.header.Content-Type: true
+
+  GetSchoolingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handler/get_schooling_handler.lambda_handler
+      Runtime: python3.12
+      CodeUri: .
+      MemorySize: 128
+      Timeout: 10
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonDynamoDBFullAccess
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Events:
+        GetSchoolingAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApi
+            Path: /students/{student_id}/{degree_id}/schooling
+            Method: get
+
+  GetDegreePathFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handler/get_university_degree_handler.lambda_handler
+      Runtime: python3.12
+      CodeUri: .
+      MemorySize: 128
+      Timeout: 10
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonDynamoDBFullAccess
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Events:
+        GetDegreePathAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApi
+            Path: /university/{degree_id}
+            Method: get
+
+  GetSubjectsByIdFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handler/get_subject_handler.lambda_handler
+      Runtime: python3.12
+      CodeUri: .
+      MemorySize: 128
+      Timeout: 10
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonDynamoDBFullAccess
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Events:
+        GetSubjectsByIdAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApi
+            Path: /university/{degree_id}/subjects/{subject_id}
+            Method: get
+
+  GetSubjectsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handler/get_subjects_handler.lambda_handler
+      Runtime: python3.12
+      CodeUri: .
+      MemorySize: 128
+      Timeout: 10
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonDynamoDBFullAccess
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Events:
+        GetSubjectsAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApi
+            Path: /university/subjects
+            Method: get
+
+  GetStudentPlanFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handler/get_student_plan_handler.lambda_handler
+      Runtime: python3.12
+      CodeUri: .
+      MemorySize: 128
+      Timeout: 10
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonDynamoDBFullAccess
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Events:
+        GetStudentPlanAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApi
+            Path: /students/{student_id}/{degree_id}/plan
+            Method: get
+
+  GetStudentLogsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handler/student_logs_handler.lambda_handler
+      Runtime: python3.12
+      CodeUri: .
+      MemorySize: 256
+      Timeout: 30
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonDynamoDBFullAccess
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Events:
+        GetStudentLogsAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApi
+            Path: /students/{student_id}/{degree_id}/logs
+            Method: get
+
+  EditStudentPlanFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handler/patch_student_plan_handler.lambda_handler
+      Runtime: python3.12
+      CodeUri: .
+      MemorySize: 128
+      Timeout: 10
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonDynamoDBFullAccess
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Events:
+        EditStudentPlanAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApi
+            Path: /students/{student_id}/{degree_id}/plan
+            Method: patch
+            RequestModel:
+              Model: EditPlanSubjectsRequestModel
+              Required: true
+            RequestParameters:
+              method.request.header.Content-Type: true
+
+  ProcessStudentActivityHistoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handler/process_student_activity_history_handler.lambda_handler
+      Runtime: python3.12
+      CodeUri: .
+      MemorySize: 2048
+      Timeout: 300
+      EphemeralStorage:
+        Size: 4096
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonDynamoDBFullAccess
+        - AmazonS3ReadOnlyAccess
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Events:
+        StudentActivityHistoryS3:
+          Type: S3
+          Properties:
+            Bucket: !Ref StudentActivityBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: ".xlsx"
+
+  SageMakerTrainFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handler/sagemaker_train_handler.sagemaker_train_handler
+      Runtime: python3.12
+      CodeUri: .
+      MemorySize: 1024
+      Timeout: 300
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonDynamoDBFullAccess
+        - AmazonS3FullAccess
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - sagemaker:CreateTrainingJob
+                - sagemaker:DescribeTrainingJob
+                - sagemaker:ListTrainingJobs
+              Resource: '*'
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt SageMakerExecutionRole.Arn
+              Condition:
+                StringLike:
+                  iam:PassedToService: sagemaker.amazonaws.com
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+                - s3:ListBucket
+              Resource:
+                - !Sub 'arn:aws:s3:::${S3BucketName}'
+                - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: '*'
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          S3_BUCKET: !Ref S3BucketName
+          S3_PREFIX: !Ref S3Prefix
+          SAGEMAKER_EXEC_ROLE_ARN: !GetAtt SageMakerExecutionRole.Arn
+      Events:
+        SageMakerTrainAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApi
+            Path: /recommenders/train
+            Method: post
+            RequestModel:
+              Model: SageMakerTrainRequestModel
+              Required: true
+
+  # ===== Predicción SageMaker =====
+  SageMakerPredictFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handler/sagemaker_predict_handler.lambda_handler
+      Runtime: python3.12
+      CodeUri: .
+      MemorySize: 1024
+      Timeout: 300
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonDynamoDBFullAccess
+        - AmazonS3FullAccess
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - sagemaker:DescribeEndpoint
+                - sagemaker:ListEndpoints
+                - sagemaker:InvokeEndpoint
+                - sagemaker:CreateModel
+                - sagemaker:CreateEndpointConfig
+                - sagemaker:CreateEndpoint
+              Resource: '*'
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt SageMakerExecutionRole.Arn
+              Condition:
+                StringLike:
+                  iam:PassedToService: sagemaker.amazonaws.com
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:ListBucket
+              Resource:
+                - !Sub 'arn:aws:s3:::${S3BucketName}'
+                - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: '*'
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          S3_BUCKET: !Ref S3BucketName
+          S3_PREFIX: !Ref S3Prefix
+          SAGEMAKER_EXEC_ROLE_ARN: !GetAtt SageMakerExecutionRole.Arn
+      Events:
+        SageMakerPredictAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApi
+            Path: /recommenders/predict
+            Method: post
+            RequestModel:
+              Model: SageMakerPredictRequestModel
+              Required: true
+
+  ASBRecommenderDockerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      PackageType: Image
+      ImageConfig:
+        Command: ["src.handler.asb_docker_handler.lambda_handler"]
+      ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/asb-recommender:latest"
+      MemorySize: 3008  
+      Timeout: 900     
+      EphemeralStorage:
+        Size: 10240     
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonDynamoDBFullAccess
+        - AmazonS3FullAccess
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Scan
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:ListBucket
+                - s3:DeleteObject
+              Resource:
+                - !Sub 'arn:aws:s3:::${S3BucketName}'
+                - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          S3_BUCKET: !Ref S3BucketName
+          S3_PREFIX: !Ref S3Prefix
+      Events:
+        ASBRecommenderDockerAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApi
+            Path: /recommenders/asb
+            Method: post
+            RequestModel:
+              Model: ASBRecommenderUnifiedRequestModel
+              Required: true
+
+Outputs:
+  ApiUrl:
+    Description: Invoke URL for el API (stage prod)
+    Value: !Sub 'https://${MyApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  SageMakerExecutionRoleArn:
+    Description: ARN del rol de SageMaker usado por los training jobs
+    Value: !GetAtt SageMakerExecutionRole.Arn
+  SageMakerECRRepositoryUri:
+    Description: URI del repositorio ECR para imágenes de SageMaker
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/ada-project-recommender'
