@@ -28,7 +28,8 @@ aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --
 
 # 3. Construir imagen Docker
 echo "🔨 Construyendo imagen Docker..."
-docker build -f Dockerfile.asb -t $ECR_REPOSITORY:$IMAGE_TAG .
+docker build --platform linux/amd64 \
+    -f Dockerfile.asb -t $ECR_REPOSITORY:$IMAGE_TAG .
 
 # 4. Etiquetar imagen para ECR
 echo "🏷️  Etiquetando imagen para ECR..."
